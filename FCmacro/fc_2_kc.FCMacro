@@ -1,0 +1,265 @@
+# noinspection PyUnresolvedReferences
+import Draft
+import FreeCAD as App
+import FreeCADGui as Gui
+import Import
+import ImportGui
+import Part
+import PartDesignGui
+import Sketcher
+
+import json
+import socket
+import threading
+import time
+
+from PySide import QtGui, QtCore
+
+from freecad_functions import *
+from constants import SCALE
+try:
+    # Get config data
+    from config import MODELS_PATH, HOST, STARTING_PORT, HEADER, FORMAT
+    config_imported = True
+except ModuleNotFoundError:
+    config_imported = False
+    error_msg = QtGui.QMessageBox.critical(None,
+                                           "Error!",
+                                           "No valid config file in directory!",
+                                           QtGui.QMessageBox.Abort)
+
+
+class FreeCADHost(QtGui.QDockWidget):
+
+    def __init__(self, HOST, STARTING_PORT, HEADER, FORMAT):
+        super().__init__()
+
+        self.HOST = HOST
+        self.STARTING_PORT = STARTING_PORT
+        self.MAX_PORT_RANGE = 20
+        self.port = self.STARTING_PORT
+        self.HEADER = HEADER
+        self.FORMAT = FORMAT
+
+        self.pcb = None
+        self.doc = App.activeDocument()
+        self.diff = None
+        self.run_loop = False
+        self.pcb_drawn = False
+
+        self.initUI()
+        # Start server when opening plugin
+        threading.Thread(target=self.startServer).start()
+        #threading.Thread(target=self.testMethod).start()
+
+    def initUI(self):
+        self.setObjectName("FreeCAD Host")
+        self.resize(QtCore.QSize(300, 100).expandedTo(self.minimumSizeHint()))  # sets size of the widget
+
+        # Text
+        self.text_connection = QtGui.QLabel("", self)
+        self.text_connection.move(30, 25)
+        self.text_connection.resize(180, 25)
+        self.text_connection.hide()
+
+        self.text_controls = QtGui.QLabel("Object controls:", self)
+        self.text_controls.move(10, 90)
+
+        # Buttons
+        self.button_start_server = QtGui.QPushButton("Accept new connection", self)
+        self.button_start_server.clicked.connect(self.onButtonStartServer)
+        self.button_start_server.move(25, 25)
+        self.button_start_server.resize(180, 25)
+
+        self.button_stop_server = QtGui.QPushButton("Stop listening", self)
+        self.button_stop_server.clicked.connect(self.onButtonStopServer)
+        self.button_stop_server.hide()
+        self.button_stop_server.move(25, 25)
+        self.button_stop_server.resize(180, 25)
+        self.button_stop_server.setEnabled(False)
+
+        # self.button_test = QtGui.QPushButton("Test", self)
+        # self.button_test.clicked.connect(self.onButtonTest)
+        # self.button_test.move(120, 120)
+        # #self.button_test.setEnabled(False)
+
+        self.button_draw_pcb = QtGui.QPushButton("Draw pcb", self)
+        self.button_draw_pcb.clicked.connect(self.onButtonDraw)
+        self.button_draw_pcb.move(10, 120)
+        self.button_draw_pcb.setEnabled(False)
+
+        self.button_apply_diff = QtGui.QPushButton("Apply diff", self)
+        self.button_apply_diff.clicked.connect(self.onButtonApplyDiff)
+        self.button_apply_diff.move(120, 120)
+        self.button_apply_diff.setEnabled(False)
+
+        self.button_scan_board = QtGui.QPushButton("Scan PCB", self)
+        self.button_scan_board.clicked.connect(self.onButtonScanBoard)
+        self.button_scan_board.move(10, 180)
+        self.button_scan_board.setEnabled(False)
+
+    # --------------------------------- Button Methods --------------------------------- #
+    def onButtonStartServer(self):
+        # Start server in another thread
+        threading.Thread(target=self.startServer).start()
+
+    def onButtonStopServer(self):
+        self.closeSocket()
+
+    def onButtonDraw(self):
+        drawPcb(doc=self.doc,
+                doc_gui=Gui.ActiveDocument,
+                pcb=self.pcb,
+                MODELS_PATH=MODELS_PATH)
+
+    def onButtonApplyDiff(self):
+        if self.pcb and self.diff:
+            updatePartFromDiff(self.doc, self.pcb, self.diff)
+
+            self.doc.recompute()
+            self.diff = None
+
+    def onButtonScanBoard(self):
+        scanFootprints(doc=self.doc,
+                       pcb=self.pcb)
+        self.doc.recompute()
+
+    # --------------------------------- Socket--------------------------------- #
+    def closeSocket(self):
+        print("Closing connection manually")
+        self.socket.close()
+        self.run_loop = False
+
+        self.button_start_server.setEnabled(True)
+        self.button_start_server.show()
+        self.button_stop_server.setEnabled(False)
+        self.button_stop_server.hide()
+
+    def startServer(self):
+        # Bug:  if socket 5050 remains from last session and new session
+        #       is on 5051, client connects to old socket 5050.
+        self.button_stop_server.setEnabled(True)
+        self.button_stop_server.show()
+        self.button_start_server.setEnabled(False)
+        self.button_start_server.hide()
+        print("[SERVER] Server starting...")
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+
+        # Loop through available sockets
+        socket_searching = True
+        while socket_searching:
+            if self.port > (self.STARTING_PORT + self.MAX_PORT_RANGE):
+                socket_searching = False
+                self.port = 5050
+                print(f"Failed to start server, port reset to: {self.port}")
+
+            try:
+                self.socket.bind((self.HOST, self.port))
+                socket_searching = False
+                # Wait for connection
+                self.socket.listen()
+                print(f"[SERVER] Server is listening on {self.HOST}, port {self.port}")
+
+                while True:
+                    # Accept new connection
+                    self.conn, self.addr = self.socket.accept()
+                    # Start handleClient method in new thread for each connection
+                    threading.Thread(target=self.handleClient).start()
+                    print("Client connected")
+                    self.socket.close()
+
+                    self.button_start_server.setEnabled(False)
+                    self.button_start_server.hide()
+                    self.button_stop_server.setEnabled(False)
+                    self.button_stop_server.hide()
+                    break
+
+            except OSError as e:
+                # BUG: error message when manually closing socket.
+                # FIX: Catch error number 10038 (on windows: Operation was attempted on
+                #                                            something that is not a socket)
+                if e.errno == 10038:
+                    pass
+                # Only one usage of each socket address is permitted
+                elif e.errno == 10048:
+                    self.port = self.port + 1
+                else:
+                    print(e)
+
+    def handleClient(self):
+        """
+        Worker thread for receiving messages from client
+        """
+        self.text_connection.setText(f"Connected to {self.addr}")
+        self.text_connection.show()
+
+        self.connected = True
+        while self.connected:
+            # Receive first message
+            first_msg = self.conn.recv(self.HEADER).decode(self.FORMAT)
+            # Check if anything was actually sent, skip if not
+            if not first_msg:
+                continue
+            # Split first message -> first half is type (pcb, diff, disconnect), second is length
+            msg_type = first_msg.split('_')[0]
+            msg_length = first_msg.split('_')[1]
+            # Receive second message
+            msg_length = int(msg_length)
+            data_raw = self.conn.recv(msg_length).decode(self.FORMAT)
+            data = json.loads(data_raw)
+
+            # Check for disconnect message
+            if msg_type == "!DIS":
+                self.connected = False
+
+            elif msg_type == "PCB":
+                # Skip if not dictionary
+                if not isinstance(data, dict):
+                    continue
+                # Skip if pcb dict already exist
+                if self.pcb:
+                    continue
+                self.pcb = data
+                self.button_draw_pcb.setEnabled(True)
+                self.button_scan_board.setEnabled(True)
+
+            elif msg_type == "DIF":
+                # Skip if not dictionary
+                if not isinstance(data, dict):
+                    continue
+                # Received diff dictionary
+                self.diff = data
+                self.button_apply_diff.setEnabled(True)
+
+            print(f"[SERVER] Message received from client:\n{data}")
+
+        print("[SERVER] Client disconnected, connection closed")
+        self.conn.close()
+
+        self.text_connection.hide()
+        self.button_stop_server.setEnabled(False)
+        self.button_stop_server.hide()
+
+        # self.button_send_message.setEnabled(False)
+        self.button_apply_diff.setEnabled(False)
+        # self.button_draw_pcb.setEnabled(False)
+        # self.button_scan_pcb.setEnabled(False)
+        self.button_start_server.setEnabled(True)
+        self.button_start_server.show()
+
+    def sendMessage(self, msg):
+        # Calculate length of first message
+        msg_length = len(msg)
+        send_length = str(msg_length).encode(self.FORMAT)
+        # Pad first message
+        send_length += b' ' * (self.HEADER - len(send_length))
+        # Send length end object
+        self.conn.send(send_length)
+        self.conn.send(msg.encode(self.FORMAT))
+
+
+if config_imported:
+    # Instantiate host plugin
+    plugin = FreeCADHost(HOST, STARTING_PORT, HEADER, FORMAT)
+    # Add the widget to the main window right area
+    Gui.getMainWindow().addDockWidget(QtCore.Qt.RightDockWidgetArea, plugin)
